@@ -32,7 +32,7 @@ const int startThrottle = 5;
 const int kicksBeforeIncreasment = 1;
 
 //Don't touch unless you know what you are doing.
-const int breakTriggered = 47;
+const int brakeTriggered = 47;
 
 //Defines how long one kick should take.
 const int drivingTime = 5000;
@@ -69,7 +69,7 @@ unsigned long kickDelayTimer = 0;
 unsigned long increasmentTimer = 0;
 bool kickAllowed = true;
 
-int BrakeHandle;
+bool isBraking = true;                  // Brake activated
 int Speed; //current speed
 int temporarySpeed = 0;
 int expectedSpeed = 0;
@@ -82,6 +82,7 @@ int averageSpeed = 0;
 
 //motionmodes
 uint8_t State = 0;
+uint8_t prevState = 0;
 #define READYSTATE 0
 #define INCREASINGSTATE 1
 #define DRIVINGSTATE 2
@@ -100,7 +101,10 @@ uint8_t State = 0;
 #define SPEEDVALUE 0x64
 #define SERIALVALUE 0x31
 
-
+auto kickTimer = timer_create_default();
+auto kickDelayTimer1 = timer_create_default();
+auto increasingTimer = timer_create_default();
+auto drivingTimer1 = timer_create_default();
 
 void logByteInHex(uint8_t val) {
     //  if(val < 16)
@@ -167,15 +171,12 @@ void loop() {
         logByteInHex(buff[i]);
     }
 
-    //  Serial.print("check ");
-    //  Serial.print(checksum, 16);
-    //
-    //  Serial.println();
+
     switch (buff[1]) {
         case DASH2MOTOR: // Destination: Dash to motor
             switch (buff[2]) {
                 case BRAKEVALUE:
-                    BrakeHandle = buff[6];
+                    isBraking = (buff[6]>brakeTriggered);
             }
         case MOTOR2DASH:
             switch (buff[2]) {
@@ -203,32 +204,33 @@ void loop() {
     motion_control();
     currentTime = millis();
     if (kickResetTimer != 0 && kickResetTimer + kickResetTime < currentTime && State == DRIVINGSTATE) resetKicks();
-    if (increasmentTimer != 0 && increasmentTimer + increasmentTime < currentTime && State == INCREASINGSTATE) endIncrease();
-    if (drivingTimer != 0 && drivingTimer + drivingTime < currentTime && State == DRIVINGSTATE) endDrive();
+    // if (increasmentTimer != 0 && increasmentTimer + increasmentTime < currentTime && State == INCREASINGSTATE) endIncrease();
+    // if (drivingTimer != 0 && drivingTimer + drivingTime < currentTime && State == DRIVINGSTATE) endDrive();
     if (kickDelayTimer == 0 || (kickDelayTimer != 0 && kickDelayTimer + kickDelay < currentTime)) {
         kickAllowed = true;
         kickDelayTimer = 0;
     } else {
         kickAllowed = false;
     }
+    kickTimer.tick();
+    kickDelayTimer.tick();
+    increasingTmer.tick();
+    drivingTimer.tick();
 }
 
 void motion_control() {
-    if ((Speed != 0) && (Speed < startThrottle)) {
+
+    // Speed is higher than 0, speed is higher than startThrottle and the user is not braking
+    if ((Speed != 0) && (Speed < startThrottle) || isBraking) {
         // If speed is under 5 km/h, stop throttle
         ThrottleWrite(45); //  0% throttle
-    }
-
-    if (BrakeHandle > breakTriggered) {
-        ThrottleWrite(45); //close throttle directly when break is touched. 0% throttle
-        digitalWrite(LED_PCB, HIGH);
+        kickTimer.cancel();
+        increasingTimer.cancel();
         if (State != BREAKINGSTATE) {
             State = BREAKINGSTATE;
             drivingTimer = 0; kickResetTimer = 0; increasmentTimer = 0;
             Serial.println("BREAKING ~> Handle pulled.");
         }
-    } else {
-        digitalWrite(LED_PCB, LOW);
     }
 
     switch(State) {
@@ -245,8 +247,7 @@ void motion_control() {
                 }
                 
                 ThrottleSpeed(temporarySpeed);
-                State = INCREASINGSTATE;
-                Serial.println("INCREASING ~> The speed has exceeded the minimum throttle speed.");
+                switchState(INCREASINGSTATE);
             }
 
             break;
@@ -295,9 +296,9 @@ void motion_control() {
             break;
         case BREAKINGSTATE:
         case DRIVEOUTSTATE:
-            if (BrakeHandle > breakTriggered) break;
+            if (isBraking) break;
             if (Speed < startThrottle) {
-                State = READYSTATE;
+                switchState(READYSTATE);
                 Serial.println("READY ~> Speed has dropped under the minimum throttle speed.");
             } else if (Speed >= averageSpeed + calculateSpeedBump(Speed)) {
                 if (State == DRIVEOUTSTATE) {
@@ -320,13 +321,39 @@ void motion_control() {
         default:
             ThrottleWrite(45);
             digitalWrite(LED_PCB, HIGH);
-            State = BREAKINGSTATE;
+            switchState(BREAKINGSTATE);
             drivingTimer = 0; kickResetTimer = 0; increasmentTimer = 0;
             Serial.println("BREAKING ~> Unknown state detected");
     }
 
 }
 
+
+void switchState(int nextState){
+    prevState = State;
+    switch(nextState){
+        case READYSTATE:
+            State = nextState;
+        case INCREASINGSTATE:
+            State = nextState;
+            increasingTimer.in(increasmentTime, switchState, DRIVINGSTATE);
+        case DRIVINGSTATE:
+            State = nextState;
+            drivingTimer1.in(drivingTime, switchState, DRIVEOUTSTATE);
+            if (prevState == INCREASINGSTATE){
+                endIncrease(); // TODO: LEGACY FUNCTION, TO BE REMOVED
+            }
+        case DRIVEOUTSTATE:
+            State = nextState;
+            if (prevState == DRIVINGSTATE){
+                endDrive(); // TODO: LEGACY FUNCTION, TO BE REMOVED
+            }
+    }
+
+
+
+
+}
 int resetKicks() {
     kickResetTimer = 0;
     kickCount = 0;
@@ -335,7 +362,6 @@ int resetKicks() {
 int endIncrease() {
     expectedSpeed = temporarySpeed;
     kickCount = 0;
-    State = DRIVINGSTATE;
     drivingTimer = currentTime;
     increasmentTimer = 0; kickResetTimer = 0;
     Serial.println("DRIVING ~> The speed has been stabilized.");
@@ -344,7 +370,6 @@ int endIncrease() {
 int endDrive() {
     drivingTimer = 0; kickResetTimer = 0;
     ThrottleWrite(45);
-    State = DRIVEOUTSTATE;
     Serial.println("READY ~> Speed has dropped under the minimum throttle speed.");
 }
 
